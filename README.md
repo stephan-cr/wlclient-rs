@@ -4,12 +4,12 @@ Wlclient
 Overview
 --------
 
-[Wayland](https://wayland.freedesktop.org/) client, which directly
-talks to the underlying [Wayland low-level
+"wlclient" is a [Wayland](https://wayland.freedesktop.org/) client,
+which directly talks to the underlying [Wayland low-level
 protocol](https://wayland.freedesktop.org/docs/html/apa.html#protocol-spec-wl_display).
 
 The goal of this project is to understand the low-level details of
-Wayland. Furthermore, it build on top of [Tokio](https://tokio.rs/),
+Wayland. Furthermore, it is build on top of [Tokio](https://tokio.rs/),
 because Wayland is asynchronous by nature.
 
 Resources
