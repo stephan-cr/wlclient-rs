@@ -1,5 +1,6 @@
 use std::env;
 use std::error;
+use std::ffi::CStr;
 use std::path::PathBuf;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -37,6 +38,10 @@ impl Iterator for IdGenerator {
     }
 }
 
+const fn pad(len: usize) -> usize {
+    (4 - (len % 4)) % 4
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn error::Error>> {
     let xdg_runtime_dir = env::var("XDG_RUNTIME_DIR")?;
@@ -52,10 +57,42 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 
     let handle = tokio::spawn(async move {
         let mut response = BytesMut::new();
-        let n = read_stream.read_buf(&mut response).await?;
-        eprintln!("{:?}", response);
+        loop {
+            let n = read_stream.read_buf(&mut response).await?;
+            eprintln!("{:?}", &response);
 
-        todo!("parse response");
+            while response.remaining() >= 8
+            /* make sure we're able to read the event header */
+            {
+                let sender = response.get_u32_le();
+                let opcode = response.get_u16_le();
+                let length = response.get_u16_le();
+
+                eprintln!(
+                    "sender = {}, length = {}, opcode = {}",
+                    sender, length, opcode
+                );
+                while response.remaining() < 8 {
+                    read_stream.read_buf(&mut response).await?;
+                }
+                let name = response.get_u32_le();
+                let len = response.get_u32_le() as usize;
+                while response.remaining() < len + pad(len) + 4 {
+                    read_stream.read_buf(&mut response).await?;
+                }
+                let interface = CStr::from_bytes_with_nul(&response[..len])
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                response.advance(len + pad(len));
+
+                let version = response.get_u32_le();
+                eprintln!(
+                    "  name = {}, interface = {:?}, version = {}",
+                    name, interface, version
+                );
+            }
+        }
 
         Ok::<(), std::io::Error>(())
     });
