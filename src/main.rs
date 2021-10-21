@@ -1,11 +1,15 @@
+#![warn(rust_2018_idioms)]
+
 use std::env;
 use std::error;
 use std::ffi::CStr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 const MAX_CLIENT_ID: u32 = 0xfe_ff_ff_ff;
 
@@ -42,6 +46,34 @@ const fn pad(len: usize) -> usize {
     (4 - (len % 4)) % 4
 }
 
+struct Object {
+    name: u32,
+    interface: String,
+    version: u32,
+}
+
+struct ObjectCache {
+    cache: Vec<Object>,
+}
+
+impl ObjectCache {
+    fn new() -> Self {
+        Self { cache: vec![] }
+    }
+
+    fn insert(&mut self, o: Object) {
+        self.cache.push(o);
+    }
+
+    fn lookup_by_interface_name(&self, interface_name: &str) -> Option<&Object> {
+        self.cache.iter().find(|&x| x.interface == interface_name)
+    }
+
+    fn lookup_by_name(&self, name: u32) -> Option<&Object> {
+        self.cache.iter().find(|&x| x.name == name)
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn error::Error>> {
     let xdg_runtime_dir = env::var("XDG_RUNTIME_DIR")?;
@@ -55,6 +87,13 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 
     let (mut read_stream, mut write_stream) = stream.into_split();
 
+    let object_cache = Arc::new(Mutex::new(ObjectCache::new()));
+
+    let (event_barrier_tx, mut event_barrier_rx): (
+        mpsc::Sender<oneshot::Sender<_>>,
+        mpsc::Receiver<oneshot::Sender<_>>,
+    ) = mpsc::channel(1);
+    let object_cache_for_task = object_cache.clone();
     let handle = tokio::spawn(async move {
         let mut response = BytesMut::new();
         loop {
@@ -72,37 +111,116 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
                     "sender = {}, length = {}, opcode = {}",
                     sender, length, opcode
                 );
-                while response.remaining() < 8 {
-                    read_stream.read_buf(&mut response).await?;
-                }
-                let name = response.get_u32_le();
-                let len = response.get_u32_le() as usize;
-                while response.remaining() < len + pad(len) + 4 {
-                    read_stream.read_buf(&mut response).await?;
-                }
-                let interface = CStr::from_bytes_with_nul(&response[..len])
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned();
-                response.advance(len + pad(len));
 
-                let version = response.get_u32_le();
-                eprintln!(
-                    "  name = {}, interface = {:?}, version = {}",
-                    name, interface, version
-                );
+                if sender == 2 && opcode == 0 {
+                    while response.remaining() < 8 {
+                        read_stream.read_buf(&mut response).await?;
+                    }
+                    let name = response.get_u32_le();
+                    let len = response.get_u32_le() as usize;
+                    while response.remaining() < len + pad(len) + 4 {
+                        read_stream.read_buf(&mut response).await?;
+                    }
+                    let interface = CStr::from_bytes_with_nul(&response[..len])
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    response.advance(len + pad(len));
+
+                    let version = response.get_u32_le();
+                    eprintln!(
+                        "  name = {}, interface = {:?}, version = {}",
+                        name, interface, version,
+                    );
+
+                    {
+                        let o = Object {
+                            name: name,
+                            interface: interface,
+                            version: version,
+                        };
+
+                        let mut inner_cache = object_cache_for_task.lock().await;
+
+                        inner_cache.insert(o);
+                    }
+                } else if sender == 3 && opcode == 0 {
+                    let back_channel = event_barrier_rx.recv().await.unwrap();
+                    back_channel.send(response.get_u32_le()).unwrap();
+                } else if sender == 1 && opcode == 0 {
+                    let object_id = response.get_u32_le();
+                    let code = response.get_u32_le();
+                    let len = response.get_u32_le() as usize;
+                    while response.remaining() < len + pad(len) {
+                        read_stream.read_buf(&mut response).await?;
+                    }
+                    let message = CStr::from_bytes_with_nul(&response[..len])
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    response.advance(len + pad(len));
+                    eprintln!("wl_display::error {}", message);
+                } else if sender == 1 && opcode == 1 {
+                    // wl_display::delete_id
+                    eprintln!("wl_display::delete_id {}", response.get_u32_le());
+                }
             }
-        }
+            response = response.split();
+        } // loop
 
         Ok::<(), std::io::Error>(())
     });
 
     let message_size = 12u16;
     let mut connection_req = BytesMut::with_capacity(message_size.into());
-    connection_req.put_u32_le(id_generator.next().unwrap());
+    let wl_display_id = id_generator.next().unwrap();
+    connection_req.put_u32_le(wl_display_id);
     connection_req.put_u16_le(1); // get_registry
     connection_req.put_u16_le(message_size);
-    connection_req.put_u32_le(id_generator.next().unwrap()); // id for the new wl_registry - global registry object
+    let wl_registry_id = id_generator.next().unwrap();
+    connection_req.put_u32_le(wl_registry_id); // id for the new wl_registry - global registry object
+    write_stream.write_all_buf(&mut connection_req).await?;
+
+    // make sure the object cache contains all current objects
+    {
+        connection_req.put_u32_le(wl_display_id);
+        connection_req.put_u16_le(0); // sync
+        connection_req.put_u16_le(message_size);
+        connection_req.put_u32_le(id_generator.next().unwrap()); // id for the new wl_callback - callback object for the sync request
+        let (one_tx, one_rx) = oneshot::channel();
+        event_barrier_tx.send(one_tx).await?;
+        write_stream.write_all_buf(&mut connection_req).await?;
+        one_rx.await.unwrap();
+        eprintln!("global object cache populated");
+    }
+
+    let (wl_compositor_name, wl_compositor_version) = {
+        let inner_cache = object_cache.lock().await;
+        inner_cache
+            .lookup_by_interface_name("wl_compositor")
+            .map(|object| (object.name, object.version))
+    }
+    .unwrap();
+
+    // bind wl_compositor
+    connection_req.clear();
+    connection_req.put_u32_le(wl_registry_id);
+    connection_req.put_u16_le(0); // wl_registry::bind
+    connection_req.put_u16_le(40);
+    connection_req.put_u32_le(wl_compositor_name); // interface "name"
+    connection_req.put_u32_le(14); // length of next string, including \0
+    connection_req.put_slice(&b"wl_compositor\0  "[..]);
+    connection_req.put_u32_le(wl_compositor_version); // wl_compositor version
+    let wl_compositor_id = id_generator.next().unwrap();
+    connection_req.put_u32_le(wl_compositor_id);
+    write_stream.write_all_buf(&mut connection_req).await?;
+
+    connection_req.clear();
+    connection_req.put_u32_le(wl_compositor_id);
+    connection_req.put_u16_le(0); // wl_compositor::create_surface
+    connection_req.put_u16_le(12);
+    let wl_surface_id = id_generator.next().unwrap();
+    connection_req.put_u32_le(wl_surface_id);
     write_stream.write_all_buf(&mut connection_req).await?;
 
     handle.await??;
