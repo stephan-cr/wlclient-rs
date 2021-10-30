@@ -6,10 +6,13 @@ use std::ffi::CStr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{
+    mpsc::{self, error::TryRecvError},
+    oneshot, Mutex,
+};
 
 const MAX_CLIENT_ID: u32 = 0xfe_ff_ff_ff;
 
@@ -82,23 +85,28 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     let mut path_to_socket = PathBuf::from(xdg_runtime_dir);
     path_to_socket.push(display);
 
-    let stream = UnixStream::connect(&path_to_socket).await?;
     let mut id_generator = IdGenerator::new();
 
+    let stream = UnixStream::connect(&path_to_socket).await?;
     let (mut read_stream, mut write_stream) = stream.into_split();
 
     let object_cache = Arc::new(Mutex::new(ObjectCache::new()));
 
     let (event_barrier_tx, mut event_barrier_rx): (
-        mpsc::Sender<oneshot::Sender<_>>,
-        mpsc::Receiver<oneshot::Sender<_>>,
+        mpsc::Sender<(u32, oneshot::Sender<_>)>,
+        mpsc::Receiver<(u32, oneshot::Sender<_>)>,
     ) = mpsc::channel(1);
     let object_cache_for_task = object_cache.clone();
     let handle = tokio::spawn(async move {
         let mut response = BytesMut::new();
         loop {
             let n = read_stream.read_buf(&mut response).await?;
-            eprintln!("{:?}", &response);
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "Wayland server gave up on us",
+                ));
+            }
 
             while response.remaining() >= 8
             /* make sure we're able to read the event header */
@@ -109,7 +117,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 
                 eprintln!(
                     "sender = {}, length = {}, opcode = {}",
-                    sender, length, opcode
+                    sender, length, opcode,
                 );
 
                 if sender == 2 && opcode == 0 {
@@ -144,10 +152,8 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 
                         inner_cache.insert(o);
                     }
-                } else if sender == 3 && opcode == 0 {
-                    let back_channel = event_barrier_rx.recv().await.unwrap();
-                    back_channel.send(response.get_u32_le()).unwrap();
                 } else if sender == 1 && opcode == 0 {
+                    // wl_display::error
                     let object_id = response.get_u32_le();
                     let code = response.get_u32_le();
                     let len = response.get_u32_le() as usize;
@@ -159,10 +165,32 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
                         .to_string_lossy()
                         .into_owned();
                     response.advance(len + pad(len));
-                    eprintln!("wl_display::error {}", message);
+                    eprintln!(
+                        "wl_display::error {}, object_id = {}, code = {}",
+                        message, object_id, code
+                    );
                 } else if sender == 1 && opcode == 1 {
                     // wl_display::delete_id
                     eprintln!("wl_display::delete_id {}", response.get_u32_le());
+                } else {
+                    let event_barrier = match event_barrier_rx.try_recv() {
+                        Ok((sender, back_channel)) => Some((sender, back_channel)),
+                        Err(TryRecvError::Empty) => None,
+                        Err(TryRecvError::Disconnected) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "All senders disconnected",
+                            ))
+                        }
+                    };
+
+                    if event_barrier.is_some() && opcode == 0 {
+                        if let Some((_sender, back_channel)) = event_barrier {
+                            // todo!("the sender #3 is an hard coded value, but each for callback a new sender id is generated");
+                            // let back_channel = event_barrier_rx.recv().await.unwrap();
+                            back_channel.send(response.get_u32_le()).unwrap();
+                        }
+                    }
                 }
             }
             response = response.split();
@@ -186,9 +214,10 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
         connection_req.put_u32_le(wl_display_id);
         connection_req.put_u16_le(0); // sync
         connection_req.put_u16_le(message_size);
-        connection_req.put_u32_le(id_generator.next().unwrap()); // id for the new wl_callback - callback object for the sync request
+        let wl_callback_id = id_generator.next().unwrap();
+        connection_req.put_u32_le(wl_callback_id); // id for the new wl_callback - callback object for the sync request
         let (one_tx, one_rx) = oneshot::channel();
-        event_barrier_tx.send(one_tx).await?;
+        event_barrier_tx.send((wl_callback_id, one_tx)).await?;
         write_stream.write_all_buf(&mut connection_req).await?;
         one_rx.await.unwrap();
         eprintln!("global object cache populated");
@@ -206,7 +235,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     connection_req.clear();
     connection_req.put_u32_le(wl_registry_id);
     connection_req.put_u16_le(0); // wl_registry::bind
-    connection_req.put_u16_le(40);
+    connection_req.put_u16_le(40); // request length
     connection_req.put_u32_le(wl_compositor_name); // interface "name"
     connection_req.put_u32_le(14); // length of next string, including \0
     connection_req.put_slice(&b"wl_compositor\0  "[..]);
@@ -218,10 +247,89 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     connection_req.clear();
     connection_req.put_u32_le(wl_compositor_id);
     connection_req.put_u16_le(0); // wl_compositor::create_surface
-    connection_req.put_u16_le(12);
+    connection_req.put_u16_le(12); // request length
     let wl_surface_id = id_generator.next().unwrap();
     connection_req.put_u32_le(wl_surface_id);
     write_stream.write_all_buf(&mut connection_req).await?;
+
+    let (xdg_wm_base_name, xdg_wm_base_version) = {
+        let inner_cache = object_cache.lock().await;
+        inner_cache
+            .lookup_by_interface_name("xdg_wm_base")
+            .map(|object| (object.name, object.version))
+    }
+    .unwrap();
+
+    {
+        // checkout why this doesn't work
+
+        // bind xdg_wm_base
+        // connection_req.clear();
+        // connection_req.put_u32_le(wl_registry_id);
+        // connection_req.put_u16_le(0); // wl_registry::bind
+        // connection_req.put_u16_le(36); // request length
+        // connection_req.put_u32_le(xdg_wm_base_name); // interface "name"
+        // connection_req.put_u32_le(12); // length of next string, including \0
+        // connection_req.put_slice(&b"xdg_wm_base\0"[..]);
+        // connection_req.put_u32_le(xdg_wm_base_version);
+        // let xdg_wm_base_id = id_generator.next().unwrap();
+        // connection_req.put_u32_le(xdg_wm_base_id);
+        // write_stream.write_all_buf(&mut connection_req).await?;
+
+        // // create an xdg_surface
+        // connection_req.clear();
+        // connection_req.put_u32_le(xdg_wm_base_id);
+        // connection_req.put_u16_le(3); // xdg_wm_base::get_xdg_surface
+        // connection_req.put_u16_le(16); // request length
+        // let xdg_surface_id = id_generator.next().unwrap();
+        // connection_req.put_u32_le(xdg_surface_id);
+        // connection_req.put_u32_le(wl_surface_id);
+        // write_stream.write_all_buf(&mut connection_req).await?;
+
+        // eprintln!("xdg_surface_id {}, xdg_wm_base_id {}", xdg_surface_id, xdg_wm_base_id);
+    }
+
+    let (wl_seat_name, wl_seat_version) = {
+        let inner_cache = object_cache.lock().await;
+        inner_cache
+            .lookup_by_interface_name("wl_seat")
+            .map(|object| (object.name, object.version))
+    }
+    .unwrap();
+
+    // bind wl_seat
+    connection_req.clear();
+    connection_req.put_u32_le(wl_registry_id);
+    connection_req.put_u16_le(0); // wl_registry::bind
+    connection_req.put_u16_le(32); // request length
+    connection_req.put_u32_le(wl_seat_name); // interface "name"
+    connection_req.put_u32_le(8); // length of next string, including \0
+    connection_req.put_slice(&b"wl_seat\0"[..]);
+    connection_req.put_u32_le(wl_seat_version);
+    let wl_seat_id = id_generator.next().unwrap();
+    connection_req.put_u32_le(wl_seat_id);
+    eprintln!(
+        "connection_req = {:?}, {}",
+        &connection_req, wl_seat_version
+    );
+    write_stream.write_all_buf(&mut connection_req).await?;
+
+    todo!("handle wl_seat::capabilities and wl_seat::name");
+
+    // make sure the object cache contains all current objects
+    {
+        connection_req.clear();
+        connection_req.put_u32_le(wl_display_id);
+        connection_req.put_u16_le(0); // sync
+        connection_req.put_u16_le(message_size);
+        let wl_callback_id = id_generator.next().unwrap();
+        connection_req.put_u32_le(wl_callback_id); // id for the new wl_callback - callback object for the sync request
+        let (one_tx, one_rx) = oneshot::channel();
+        event_barrier_tx.send((wl_callback_id, one_tx)).await?;
+        write_stream.write_all_buf(&mut connection_req).await?;
+        one_rx.await.unwrap();
+        eprintln!("global object cache populated");
+    }
 
     handle.await??;
 
