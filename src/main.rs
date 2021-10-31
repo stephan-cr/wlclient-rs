@@ -190,6 +190,12 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
                             // let back_channel = event_barrier_rx.recv().await.unwrap();
                             back_channel.send(response.get_u32_le()).unwrap();
                         }
+                    } else {
+                        // unknown event: we ignore unknown event
+                        while response.remaining() < (length as usize - 8) {
+                            read_stream.read_buf(&mut response).await?;
+                        }
+                        response.advance(length as usize - 8);
                     }
                 }
             }
