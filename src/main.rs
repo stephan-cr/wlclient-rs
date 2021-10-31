@@ -406,8 +406,64 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
         event_barrier_tx.send((wl_callback_id, one_tx)).await?;
         write_stream.write_all_buf(&mut connection_req).await?;
         one_rx.await.unwrap();
-        eprintln!("global object cache populated");
     }
+
+    // get_pointer
+    connection_req.clear();
+    connection_req.put_u32_le(wl_seat_id);
+    connection_req.put_u16_le(0); // wl_seat::get_pointer
+    connection_req.put_u16_le(12); // request length
+    let wl_pointer_id = id_generator.next().unwrap();
+    connection_req.put_u32_le(dbg!(wl_pointer_id));
+
+    // get_keyboard
+    connection_req.put_u32_le(wl_seat_id);
+    connection_req.put_u16_le(1); // wl_seat::get_keyboard
+    connection_req.put_u16_le(12); // request length
+    let wl_keyboard_id = id_generator.next().unwrap();
+    connection_req.put_u32_le(dbg!(wl_keyboard_id));
+    {
+        let mut event_table_inner = event_table.lock().await;
+        event_table_inner.insert(
+            wl_keyboard_id,
+            move |response: &mut dyn Buf, opcode: u16, length: u16| {
+                if opcode == 0 {
+                    // wl_keyboard::keymap
+                    //
+                    // The format of the message is unclear. The
+                    // message header says length 16, which means 8
+                    // bytes for header and 8 bytes for payload. And
+                    // according to the documentation, the payload
+                    // should contain 4 bytes for "format", 4 bytes
+                    // for "fd" and 4 bytes for "size", which is too
+                    // much. How can that be?
+                    //
+                    // The second parameter "fd" of type "fd" is
+                    // somehow passed via "ancillary data" of the Unix
+                    // domain socket. From the Wayland documentation
+                    // "The file descriptor is not stored in the
+                    // message buffer, but in the ancillary data of
+                    // the UNIX domain socket message
+                    // (msg_control).". WTF is "ancillary data"?
+                    let format = response.get_u32_le();
+                    let fd = 0;
+                    let keymap_size_bytes = response.get_u32_le();
+                    eprintln!(
+                        "format = {}, fd = {}, keymap_size_bytes = {}",
+                        format, fd, keymap_size_bytes
+                    );
+                } else if opcode == 5 {
+                    // wl_keyboard::repeat_info
+                    let rate = response.get_i32_le(); // characters per second
+                    let delay = response.get_i32_le(); // in milliseconds
+                    eprintln!("rate = {}, delay = {}", rate, delay);
+                }
+            },
+        );
+    }
+
+    // write a combined get_pointer & get_keyboard request
+    write_stream.write_all_buf(&mut connection_req).await?;
 
     handle.await??;
 
