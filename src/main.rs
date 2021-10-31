@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::{Buf, BufMut, BytesMut};
+use enumflags2::BitFlags;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{
@@ -100,6 +101,19 @@ impl<'a> EventTable<'a> {
         } else {
             false
         }
+    }
+}
+
+mod wl {
+    use enumflags2::{bitflags};
+
+    #[bitflags]
+    #[repr(u32)]
+    #[derive(Clone, Copy, Debug)]
+    pub (crate) enum SeatCapability {
+        Pointer = 1,
+        Keyboard = 2,
+        Touch = 4,
     }
 }
 
@@ -244,9 +258,9 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 
                 {
                     let o = Object {
-                        name: name,
-                        interface: interface,
-                        version: version,
+                        name,
+                        interface,
+                        version,
                     };
 
                     let mut inner_cache = object_cache_for_task.lock().unwrap();
@@ -357,6 +371,30 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     connection_req.put_u32_le(wl_seat_version);
     let wl_seat_id = id_generator.next().unwrap();
     connection_req.put_u32_le(wl_seat_id);
+    let wl_display_id = id_generator.next().unwrap();
+    {
+        let mut event_table_inner = event_table.lock().await;
+        event_table_inner.insert(
+            wl_seat_id,
+            move |response: &mut dyn Buf, opcode: u16, length: u16| {
+                if opcode == 0 {
+                    // wl_seat::capabilities
+                    let capabilities = response.get_u32_le();
+                    let capabilities: BitFlags<wl::SeatCapability> = BitFlags::from_bits(capabilities).expect("valid wl_seat capabilities");
+                    eprintln!("capability = {:#?}", capabilities);
+                } else if opcode == 1 {
+                    // wl_seat::name
+                    let len = response.get_u32_le() as usize;
+                    let seat = CStr::from_bytes_with_nul(&response.chunk()[..len])
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    response.advance(len + pad(len));
+                    eprintln!("seat = {}", seat);
+                }
+            },
+        );
+    }
     write_stream.write_all_buf(&mut connection_req).await?;
 
     //todo!("handle wl_seat::capabilities and wl_seat::name");
