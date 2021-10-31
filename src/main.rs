@@ -1,5 +1,6 @@
 #![warn(rust_2018_idioms)]
 
+use std::collections::HashMap;
 use std::env;
 use std::error;
 use std::ffi::CStr;
@@ -77,6 +78,31 @@ impl ObjectCache {
     }
 }
 
+struct EventTable<'a> {
+    table: HashMap<u32, Box<dyn Fn(&mut dyn Buf, u16, u16) + Send + 'a>>,
+}
+
+impl<'a> EventTable<'a> {
+    fn new() -> Self {
+        Self {
+            table: HashMap::new(),
+        }
+    }
+
+    fn insert<F: 'a + Fn(&mut dyn Buf, u16, u16) + Send>(&mut self, id: u32, f: F) {
+        self.table.insert(id, Box::new(f));
+    }
+
+    fn decode(&self, sender: u32, buf: &mut dyn Buf, opcode: u16, length: u16) -> bool {
+        if self.table.contains_key(&sender) {
+            self.table[&sender](buf, opcode, length);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn error::Error>> {
     let xdg_runtime_dir = env::var("XDG_RUNTIME_DIR")?;
@@ -90,13 +116,15 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     let stream = UnixStream::connect(&path_to_socket).await?;
     let (mut read_stream, mut write_stream) = stream.into_split();
 
-    let object_cache = Arc::new(Mutex::new(ObjectCache::new()));
+    let object_cache = Arc::new(std::sync::Mutex::new(ObjectCache::new()));
+    let event_table = Arc::new(Mutex::new(EventTable::new()));
 
     let (event_barrier_tx, mut event_barrier_rx): (
         mpsc::Sender<(u32, oneshot::Sender<_>)>,
         mpsc::Receiver<(u32, oneshot::Sender<_>)>,
     ) = mpsc::channel(1);
     let object_cache_for_task = object_cache.clone();
+    let event_table_for_task = event_table.clone();
     let handle = tokio::spawn(async move {
         let mut response = BytesMut::new();
         loop {
@@ -115,88 +143,43 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
                 let opcode = response.get_u16_le();
                 let length = response.get_u16_le();
 
+                // make sure we can read the rest of the event in one go
+                while response.remaining() < (length as usize - 8) {
+                    read_stream.read_buf(&mut response).await?;
+                }
+
                 eprintln!(
                     "sender = {}, length = {}, opcode = {}",
                     sender, length, opcode,
                 );
 
-                if sender == 2 && opcode == 0 {
-                    while response.remaining() < 8 {
-                        read_stream.read_buf(&mut response).await?;
+                {
+                    let event_table_inner = event_table_for_task.lock().await;
+                    if event_table_inner.decode(sender, &mut response, opcode, length) {
+                        continue;
                     }
-                    let name = response.get_u32_le();
-                    let len = response.get_u32_le() as usize;
-                    while response.remaining() < len + pad(len) + 4 {
-                        read_stream.read_buf(&mut response).await?;
+                }
+
+                let event_barrier = match event_barrier_rx.try_recv() {
+                    Ok((sender, back_channel)) => Some((sender, back_channel)),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "All senders disconnected",
+                        ))
                     }
-                    let interface = CStr::from_bytes_with_nul(&response[..len])
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned();
-                    response.advance(len + pad(len));
+                };
 
-                    let version = response.get_u32_le();
-                    eprintln!(
-                        "  name = {}, interface = {:?}, version = {}",
-                        name, interface, version,
-                    );
-
-                    {
-                        let o = Object {
-                            name: name,
-                            interface: interface,
-                            version: version,
-                        };
-
-                        let mut inner_cache = object_cache_for_task.lock().await;
-
-                        inner_cache.insert(o);
+                if event_barrier.is_some() && opcode == 0 {
+                    if let Some((_sender, back_channel)) = event_barrier {
+                        // todo!("the sender #3 is an hard coded value, but each for callback a new sender id is generated");
+                        // let back_channel = event_barrier_rx.recv().await.unwrap();
+                        back_channel.send(response.get_u32_le()).unwrap();
                     }
-                } else if sender == 1 && opcode == 0 {
-                    // wl_display::error
-                    let object_id = response.get_u32_le();
-                    let code = response.get_u32_le();
-                    let len = response.get_u32_le() as usize;
-                    while response.remaining() < len + pad(len) {
-                        read_stream.read_buf(&mut response).await?;
-                    }
-                    let message = CStr::from_bytes_with_nul(&response[..len])
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned();
-                    response.advance(len + pad(len));
-                    eprintln!(
-                        "wl_display::error {}, object_id = {}, code = {}",
-                        message, object_id, code
-                    );
-                } else if sender == 1 && opcode == 1 {
-                    // wl_display::delete_id
-                    eprintln!("wl_display::delete_id {}", response.get_u32_le());
                 } else {
-                    let event_barrier = match event_barrier_rx.try_recv() {
-                        Ok((sender, back_channel)) => Some((sender, back_channel)),
-                        Err(TryRecvError::Empty) => None,
-                        Err(TryRecvError::Disconnected) => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "All senders disconnected",
-                            ))
-                        }
-                    };
-
-                    if event_barrier.is_some() && opcode == 0 {
-                        if let Some((_sender, back_channel)) = event_barrier {
-                            // todo!("the sender #3 is an hard coded value, but each for callback a new sender id is generated");
-                            // let back_channel = event_barrier_rx.recv().await.unwrap();
-                            back_channel.send(response.get_u32_le()).unwrap();
-                        }
-                    } else {
-                        // unknown event: we ignore unknown event
-                        while response.remaining() < (length as usize - 8) {
-                            read_stream.read_buf(&mut response).await?;
-                        }
-                        response.advance(length as usize - 8);
-                    }
+                    // unknown event: we ignore unknown event
+                    response.advance(length as usize - 8);
                 }
             }
             response = response.split();
@@ -208,11 +191,71 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     let message_size = 12u16;
     let mut connection_req = BytesMut::with_capacity(message_size.into());
     let wl_display_id = id_generator.next().unwrap();
+    {
+        let mut event_table_inner = event_table.lock().await;
+        event_table_inner.insert(
+            wl_display_id,
+            move |response: &mut dyn Buf, opcode: u16, length: u16| {
+                if opcode == 0 {
+                    // wl_display::error
+                    let object_id = response.get_u32_le();
+                    let code = response.get_u32_le();
+                    let len = response.get_u32_le() as usize;
+                    let message = CStr::from_bytes_with_nul(&response.chunk()[..len])
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    response.advance(len + pad(len));
+                    eprintln!(
+                        "wl_display::error {}, object_id = {}, code = {}",
+                        message, object_id, code
+                    );
+                } else if opcode == 1 {
+                    // wl_display::delete_id
+                    eprintln!("wl_display::delete_id {}", response.get_u32_le());
+                }
+            },
+        );
+    }
     connection_req.put_u32_le(wl_display_id);
     connection_req.put_u16_le(1); // get_registry
     connection_req.put_u16_le(message_size);
     let wl_registry_id = id_generator.next().unwrap();
     connection_req.put_u32_le(wl_registry_id); // id for the new wl_registry - global registry object
+    {
+        let mut event_table_inner = event_table.lock().await;
+        event_table_inner.insert(
+            wl_registry_id,
+            move |response: &mut dyn Buf, opcode: u16, length: u16| {
+                // wl_registry::global
+                let name = response.get_u32_le();
+                let len = response.get_u32_le() as usize;
+                let interface = CStr::from_bytes_with_nul(&response.chunk()[..len])
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                response.advance(len + pad(len));
+
+                let version = response.get_u32_le();
+                eprintln!(
+                    "  name = {}, interface = {:?}, version = {}",
+                    name, interface, version,
+                );
+
+                {
+                    let o = Object {
+                        name: name,
+                        interface: interface,
+                        version: version,
+                    };
+
+                    let mut inner_cache = object_cache_for_task.lock().unwrap();
+
+                    inner_cache.insert(o);
+                }
+            },
+        );
+    }
     write_stream.write_all_buf(&mut connection_req).await?;
 
     // make sure the object cache contains all current objects
@@ -230,7 +273,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     }
 
     let (wl_compositor_name, wl_compositor_version) = {
-        let inner_cache = object_cache.lock().await;
+        let inner_cache = object_cache.lock().unwrap();
         inner_cache
             .lookup_by_interface_name("wl_compositor")
             .map(|object| (object.name, object.version))
@@ -259,7 +302,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     write_stream.write_all_buf(&mut connection_req).await?;
 
     let (xdg_wm_base_name, xdg_wm_base_version) = {
-        let inner_cache = object_cache.lock().await;
+        let inner_cache = object_cache.lock().unwrap();
         inner_cache
             .lookup_by_interface_name("xdg_wm_base")
             .map(|object| (object.name, object.version))
@@ -296,7 +339,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     }
 
     let (wl_seat_name, wl_seat_version) = {
-        let inner_cache = object_cache.lock().await;
+        let inner_cache = object_cache.lock().unwrap();
         inner_cache
             .lookup_by_interface_name("wl_seat")
             .map(|object| (object.name, object.version))
@@ -314,13 +357,9 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     connection_req.put_u32_le(wl_seat_version);
     let wl_seat_id = id_generator.next().unwrap();
     connection_req.put_u32_le(wl_seat_id);
-    eprintln!(
-        "connection_req = {:?}, {}",
-        &connection_req, wl_seat_version
-    );
     write_stream.write_all_buf(&mut connection_req).await?;
 
-    todo!("handle wl_seat::capabilities and wl_seat::name");
+    //todo!("handle wl_seat::capabilities and wl_seat::name");
 
     // make sure the object cache contains all current objects
     {
