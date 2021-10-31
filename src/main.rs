@@ -372,7 +372,6 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     connection_req.put_u32_le(wl_seat_version);
     let wl_seat_id = id_generator.next().unwrap();
     connection_req.put_u32_le(wl_seat_id);
-    let wl_display_id = id_generator.next().unwrap();
     {
         let mut event_table_inner = event_table.lock().await;
         event_table_inner.insert(
