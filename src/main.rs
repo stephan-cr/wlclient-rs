@@ -104,13 +104,24 @@ impl<'a> EventTable<'a> {
     }
 }
 
+fn decode_wl_string(buf: &mut dyn Buf) -> String {
+    let len = buf.get_u32_le() as usize;
+    let wl_string = CStr::from_bytes_with_nul(&buf.chunk()[..len])
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    buf.advance(len + pad(len));
+
+    wl_string
+}
+
 mod wl {
-    use enumflags2::{bitflags};
+    use enumflags2::bitflags;
 
     #[bitflags]
     #[repr(u32)]
     #[derive(Clone, Copy, Debug)]
-    pub (crate) enum SeatCapability {
+    pub(crate) enum SeatCapability {
         Pointer = 1,
         Keyboard = 2,
         Touch = 4,
@@ -214,12 +225,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
                     // wl_display::error
                     let object_id = response.get_u32_le();
                     let code = response.get_u32_le();
-                    let len = response.get_u32_le() as usize;
-                    let message = CStr::from_bytes_with_nul(&response.chunk()[..len])
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned();
-                    response.advance(len + pad(len));
+                    let message = decode_wl_string(response);
                     eprintln!(
                         "wl_display::error {}, object_id = {}, code = {}",
                         message, object_id, code
@@ -243,12 +249,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
             move |response: &mut dyn Buf, opcode: u16, length: u16| {
                 // wl_registry::global
                 let name = response.get_u32_le();
-                let len = response.get_u32_le() as usize;
-                let interface = CStr::from_bytes_with_nul(&response.chunk()[..len])
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned();
-                response.advance(len + pad(len));
+                let interface = decode_wl_string(response);
 
                 let version = response.get_u32_le();
                 eprintln!(
@@ -380,16 +381,11 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
                 if opcode == 0 {
                     // wl_seat::capabilities
                     let capabilities = response.get_u32_le();
-                    let capabilities: BitFlags<wl::SeatCapability> = BitFlags::from_bits(capabilities).expect("valid wl_seat capabilities");
+                    let capabilities: BitFlags<wl::SeatCapability> =
+                        BitFlags::from_bits(capabilities).expect("valid wl_seat capabilities");
                     eprintln!("capability = {:#?}", capabilities);
                 } else if opcode == 1 {
-                    // wl_seat::name
-                    let len = response.get_u32_le() as usize;
-                    let seat = CStr::from_bytes_with_nul(&response.chunk()[..len])
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned();
-                    response.advance(len + pad(len));
+                    let seat = decode_wl_string(response);
                     eprintln!("seat = {}", seat);
                 }
             },
